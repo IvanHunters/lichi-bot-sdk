@@ -95,13 +95,13 @@ _ = c.SendVoice(ctx, chatID, "note.ogg", "audio/ogg", ogg, "", 4200) // duration
 
 ## Voice calls
 
-A bot can call a user who has written to it first and play a pre-recorded Opus
-clip into the call, then hang up. Encode the clip as Opus in an Ogg container
-(`ffmpeg -i in.mp3 -c:a libopus -ac 1 -ar 48000 out.ogg`):
+A bot can call a user who has written to it first and play a pre-recorded audio
+clip into the call, then hang up. The clip may be any common format (mp3, m4a,
+wav, ogg/opus) — the server transcodes it:
 
 ```go
-ogg, _ := os.ReadFile("hello.ogg")
-callID, _ := c.CallUser(ctx, chatID, ogg)
+audio, _ := os.ReadFile("hello.mp3")
+callID, _ := c.CallUser(ctx, chatID, audio)
 ```
 
 The call's outcome arrives on `GetUpdates` as an `Update.CallEvent`:

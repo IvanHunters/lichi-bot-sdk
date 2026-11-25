@@ -273,13 +273,14 @@ func (c *Client) SendVoice(ctx context.Context, chatID, filename, contentType st
 		map[string]string{"duration": strconv.Itoa(durationMs)})
 }
 
-// CallUser places a voice call to chatID that plays ogg (Opus in an Ogg
-// container, 48 kHz — encode with `ffmpeg -i in.mp3 -c:a libopus -ac 1 -ar 48000
-// out.ogg`) once the user answers, then hangs up. It returns the new call_id.
-// The direction gate applies: the user must have written to the bot first, else
-// this fails with a 403. The call's outcome arrives on GetUpdates as an Update
-// with a CallEvent (answered / rejected / ended).
-func (c *Client) CallUser(ctx context.Context, chatID string, ogg []byte) (string, error) {
+// CallUser places a voice call to chatID that plays the given audio clip once
+// the user answers, then hangs up. audio may be any common format (mp3, m4a,
+// wav, ogg/opus) — the server transcodes it; an undecodable file returns a 400.
+// It returns the new call_id. The direction gate applies: the user must have
+// written to the bot first, else this fails with a 403. The call's outcome
+// arrives on GetUpdates as an Update with a CallEvent (answered / rejected /
+// ended).
+func (c *Client) CallUser(ctx context.Context, chatID string, audio []byte) (string, error) {
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
 	if err := mw.WriteField("chat_id", chatID); err != nil {
@@ -292,7 +293,7 @@ func (c *Client) CallUser(ctx context.Context, chatID string, ogg []byte) (strin
 	if err != nil {
 		return "", err
 	}
-	if _, err := part.Write(ogg); err != nil {
+	if _, err := part.Write(audio); err != nil {
 		return "", err
 	}
 	if err := mw.Close(); err != nil {
