@@ -6,10 +6,9 @@
 // Example (echo bot):
 //
 //	c := lichibot.New("https://lichi.chat", token)
-//	ctx := context.Background()
-//	c.Run(ctx, func(c *lichibot.Client, u lichibot.Update) {
+//	c.Run(context.Background(), func(c *lichibot.Client, u lichibot.Update) {
 //		if u.Message != nil && u.Message.Text != "" {
-//			_ = c.SendMessage(ctx, u.Message.From, "echo: "+u.Message.Text)
+//			_ = c.SendMessage(u.Message.From, "echo: "+u.Message.Text)
 //		}
 //	})
 package lichibot
@@ -19,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"mime/multipart"
 	"net/http"
 	"net/textproto"
@@ -51,6 +51,42 @@ type Message struct {
 	From  string `json:"from"`
 	To    string `json:"to"`
 	Text  string `json:"text"`
+	// Media carries attachments the user sent (photos, documents, video, voice,
+	// round notes). Download the bytes with Client.Download(ctx, m.From, md.ID).
+	Media []Media `json:"media,omitempty"`
+	// Checklist is non-nil when the message is a shared checklist (a to-do list)
+	// instead of plain text.
+	Checklist *Checklist `json:"checklist,omitempty"`
+}
+
+// Media is one attachment on an incoming message. Use the kind helpers to branch.
+type Media struct {
+	ID          string `json:"id"`
+	ContentType string `json:"content_type"`
+	Size        int64  `json:"size,omitempty"`
+	Filename    string `json:"filename,omitempty"`
+	DurationMs  int    `json:"duration_ms,omitempty"`
+	Circle      bool   `json:"circle,omitempty"` // a round video note
+}
+
+func (m Media) IsImage() bool { return strings.HasPrefix(m.ContentType, "image/") }
+func (m Media) IsVideo() bool { return strings.HasPrefix(m.ContentType, "video/") }
+func (m Media) IsVoice() bool { return strings.HasPrefix(m.ContentType, "audio/") }
+func (m Media) IsFile() bool {
+	return !m.IsImage() && !m.IsVideo() && !m.IsVoice()
+}
+
+// Checklist is a shared to-do list carried by a message.
+type Checklist struct {
+	Title string          `json:"title"`
+	Items []ChecklistItem `json:"items"`
+}
+
+// ChecklistItem is one line of a checklist.
+type ChecklistItem struct {
+	ID      string `json:"id"`
+	Text    string `json:"text"`
+	Checked bool   `json:"checked"`
 }
 
 // InlineQuery is an inline_query update: the user typed "@bot <query>".
@@ -99,11 +135,23 @@ type CallbackQuery struct {
 }
 
 // Update is one queue entry.
+// CallEvent is a call_event update: the outcome of a call the bot placed with
+// CallUser. Status is "answered", "rejected", or "ended"; for "ended", Reason is
+// "completed" (the clip played out), "no_answer" (the ring timed out), or
+// "hangup" (the user hung up).
+type CallEvent struct {
+	CallID string `json:"call_id"`
+	UserID string `json:"user_id"`
+	Status string `json:"status"`
+	Reason string `json:"reason"`
+}
+
 type Update struct {
 	UpdateID      int64          `json:"update_id"`
 	Message       *Message       `json:"message"`
 	InlineQuery   *InlineQuery   `json:"inline_query"`
 	CallbackQuery *CallbackQuery `json:"callback_query"`
+	CallEvent     *CallEvent     `json:"call_event"`
 }
 
 // User is the getMe result (subset).
@@ -212,11 +260,155 @@ func (c *Client) SendDocument(ctx context.Context, chatID, filename, contentType
 	return c.sendMedia(ctx, "sendDocument", chatID, filename, contentType, data, caption, nil)
 }
 
+// SendVideo uploads a video (video/*) to chatID with an optional caption, shown
+// as an inline video bubble.
+func (c *Client) SendVideo(ctx context.Context, chatID, filename, contentType string, data []byte, caption string) error {
+	return c.sendMedia(ctx, "sendVideo", chatID, filename, contentType, data, caption, nil)
+}
+
 // SendVoice uploads a voice note (audio/*) to chatID. durationMs > 0 makes the
 // client render the waveform voice bubble rather than a plain file.
 func (c *Client) SendVoice(ctx context.Context, chatID, filename, contentType string, data []byte, caption string, durationMs int) error {
 	return c.sendMedia(ctx, "sendVoice", chatID, filename, contentType, data, caption,
 		map[string]string{"duration": strconv.Itoa(durationMs)})
+}
+
+// CallUser places a voice call to chatID that plays ogg (Opus in an Ogg
+// container, 48 kHz — encode with `ffmpeg -i in.mp3 -c:a libopus -ac 1 -ar 48000
+// out.ogg`) once the user answers, then hangs up. It returns the new call_id.
+// The direction gate applies: the user must have written to the bot first, else
+// this fails with a 403. The call's outcome arrives on GetUpdates as an Update
+// with a CallEvent (answered / rejected / ended).
+func (c *Client) CallUser(ctx context.Context, chatID string, ogg []byte) (string, error) {
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	if err := mw.WriteField("chat_id", chatID); err != nil {
+		return "", err
+	}
+	h := textproto.MIMEHeader{}
+	h.Set("Content-Disposition", `form-data; name="voice"; filename="clip.ogg"`)
+	h.Set("Content-Type", "audio/ogg")
+	part, err := mw.CreatePart(h)
+	if err != nil {
+		return "", err
+	}
+	if _, err := part.Write(ogg); err != nil {
+		return "", err
+	}
+	if err := mw.Close(); err != nil {
+		return "", err
+	}
+	url := c.baseURL + "/bot/" + c.token + "/callUser"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, &buf)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	var env apiEnvelope
+	if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
+		return "", fmt.Errorf("lichibot: decode callUser: %w", err)
+	}
+	if !env.OK {
+		return "", fmt.Errorf("lichibot: callUser: %s (code %d)", env.Description, env.ErrorCode)
+	}
+	var out struct {
+		CallID string `json:"call_id"`
+	}
+	if err := json.Unmarshal(env.Result, &out); err != nil {
+		return "", fmt.Errorf("lichibot: callUser result: %w", err)
+	}
+	return out.CallID, nil
+}
+
+// Download fetches the bytes of a received attachment. owner is the media owner
+// (use the incoming Message.From), id is Media.ID. Authenticated by the bot
+// token — the bot may download anything a user sent it (and its own uploads).
+func (c *Client) Download(ctx context.Context, owner, id string) ([]byte, error) {
+	url := c.baseURL + "/bot/" + c.token + "/file/" + owner + "/" + id
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("lichibot: download %s/%s: status %d", owner, id, resp.StatusCode)
+	}
+	return io.ReadAll(resp.Body)
+}
+
+// SendChecklist sends a shared to-do list (title + items) to chatID. Items are
+// created unchecked; either party can tick them.
+func (c *Client) SendChecklist(ctx context.Context, chatID, title string, items []string) error {
+	return c.call(ctx, "sendChecklist",
+		map[string]any{"chat_id": chatID, "title": title, "items": items}, nil)
+}
+
+// MediaUpload is one file for SendMediaGroup.
+type MediaUpload struct {
+	Filename    string
+	ContentType string
+	Data        []byte
+}
+
+// SendMediaGroup sends several files as one album message with an optional
+// caption (max 10 files — extras are ignored by the server).
+func (c *Client) SendMediaGroup(ctx context.Context, chatID, caption string, files []MediaUpload) error {
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	if err := mw.WriteField("chat_id", chatID); err != nil {
+		return err
+	}
+	if caption != "" {
+		if err := mw.WriteField("caption", caption); err != nil {
+			return err
+		}
+	}
+	for i, f := range files {
+		h := textproto.MIMEHeader{}
+		h.Set("Content-Disposition",
+			fmt.Sprintf(`form-data; name="file%d"; filename=%q`, i, f.Filename))
+		if f.ContentType != "" {
+			h.Set("Content-Type", f.ContentType)
+		}
+		part, err := mw.CreatePart(h)
+		if err != nil {
+			return err
+		}
+		if _, err := part.Write(f.Data); err != nil {
+			return err
+		}
+	}
+	if err := mw.Close(); err != nil {
+		return err
+	}
+	url := c.baseURL + "/bot/" + c.token + "/sendMediaGroup"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, &buf)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	var env apiEnvelope
+	if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
+		return fmt.Errorf("lichibot: decode sendMediaGroup: %w", err)
+	}
+	if !env.OK {
+		return fmt.Errorf("lichibot: sendMediaGroup: %s (code %d)", env.Description, env.ErrorCode)
+	}
+	return nil
 }
 
 // sendMedia posts a multipart request (chat_id + caption + optional extra

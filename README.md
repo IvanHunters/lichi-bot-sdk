@@ -93,6 +93,26 @@ _ = c.SendDocument(ctx, chatID, "report.pdf", "application/pdf", pdf, "")
 _ = c.SendVoice(ctx, chatID, "note.ogg", "audio/ogg", ogg, "", 4200) // duration ms
 ```
 
+## Voice calls
+
+A bot can call a user who has written to it first and play a pre-recorded Opus
+clip into the call, then hang up. Encode the clip as Opus in an Ogg container
+(`ffmpeg -i in.mp3 -c:a libopus -ac 1 -ar 48000 out.ogg`):
+
+```go
+ogg, _ := os.ReadFile("hello.ogg")
+callID, _ := c.CallUser(ctx, chatID, ogg)
+```
+
+The call's outcome arrives on `GetUpdates` as an `Update.CallEvent`:
+
+```go
+if ce := u.CallEvent; ce != nil {
+	// ce.Status: "answered" | "rejected" | "ended"
+	// for "ended", ce.Reason: "completed" | "no_answer" | "hangup"
+}
+```
+
 ## Inline mode
 
 When a user types `@yourbot <query>` in any chat you get an
@@ -118,7 +138,9 @@ if iq := u.InlineQuery; iq != nil {
 | `EditMessageReplyMarkup(ctx, chatID, msgID, kb)` | Replace a message's buttons (`nil` clears) |
 | `AnswerCallback(ctx, cbID, text, showAlert)` | Answer a tapped callback button |
 | `AnswerInlineQuery(ctx, iqID, results)` | Answer an inline query |
-| `SendPhoto` / `SendDocument` / `SendVoice` | Upload media |
+| `SendPhoto` / `SendDocument` / `SendVideo` / `SendVoice` | Upload media |
+| `CallUser(ctx, chatID, ogg)` | Place a voice call that plays an Opus clip |
+| `Download(ctx, owner, id)` | Fetch an attachment the user sent |
 | `SetCommands(ctx, cmds)` | Set the `/` command menu |
 | `GetUpdates(ctx, timeout)` / `Run(ctx, onUpdate)` | Receive updates |
 
